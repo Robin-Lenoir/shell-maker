@@ -201,19 +201,7 @@ Return an alist with details of all overlays added:
        (cdr (map-elt inline-code 'body))))
     (markdown-overlays--fontify-tables tables)
     (when markdown-overlays-render-latex
-      (require 'org)
-      ;; Silence org-element warnings.
-      (let ((major-mode 'org-mode))
-        (save-excursion
-          (dolist (range (markdown-overlays--invert-ranges
-                          avoid-ranges
-                          (point-min)
-                          (point-max)))
-            (org-format-latex
-             (concat org-preview-latex-image-directory "markdown-overlays")
-             (car range) (cdr range)
-             temporary-file-directory
-             'overlays nil 'forbuffer org-preview-latex-default-process)))))
+      (markdown-overlays--render-latex-async avoid-ranges))
     `((source-blocks . ,source-blocks)
       (inline-codes . ,inline-codes)
       (links . ,links)
@@ -225,6 +213,117 @@ Return an alist with details of all overlays added:
       (strikethroughs . ,strikethroughs)
       (tables . ,tables)
       (avoided-ranges . ,avoid-ranges))))
+
+(defvar markdown-overlays--latex-cache-dir
+  (expand-file-name "markdown-overlays-latex" temporary-file-directory)
+  "Directory for cached LaTeX renderings.")
+
+(defvar markdown-overlays--latex-regexp
+  (rx (or (seq "\\(" (group-n 1 (+? anything)) "\\)")
+          (seq "\\[" (group-n 2 (+? anything)) "\\]")
+          (seq "$$" (group-n 3 (+? anything)) "$$")))
+  "Regexp matching LaTeX fragments: \\(...\\), \\[...\\], and $$...$$.")
+
+(defun markdown-overlays--latex-cache-file (hash)
+  "Return cache file path for content HASH."
+  (unless (file-directory-p markdown-overlays--latex-cache-dir)
+    (make-directory markdown-overlays--latex-cache-dir t))
+  (expand-file-name (concat hash ".png") markdown-overlays--latex-cache-dir))
+
+(defun markdown-overlays--place-latex-overlay (image-file beg end buffer)
+  "Place an image overlay in BUFFER between BEG and END using IMAGE-FILE."
+  (when (and (buffer-live-p buffer)
+             (file-exists-p image-file)
+             (> (file-attribute-size (file-attributes image-file)) 0))
+    (with-current-buffer buffer
+      (save-excursion
+        ;; Remove any existing latex overlay in this range.
+        (dolist (ov (overlays-in beg end))
+          (when (eq (overlay-get ov 'category) 'markdown-overlays-latex)
+            (delete-overlay ov)))
+        (let ((ov (make-overlay beg end nil t nil)))
+          (overlay-put ov 'display
+                       (create-image image-file 'png nil
+                                     :ascent 'center
+                                     :margin 2))
+          (overlay-put ov 'category 'markdown-overlays-latex)
+          (overlay-put ov 'evaporate t)
+          (overlay-put ov 'modification-hooks
+                       (list (lambda (ov &rest _) (delete-overlay ov)))))))))
+
+(defun markdown-overlays--render-latex-fragment (latex-string beg end buffer)
+  "Render LATEX-STRING asynchronously, place overlay between BEG and END in BUFFER."
+  (let* ((hash (sha1 latex-string))
+         (cache-file (markdown-overlays--latex-cache-file hash))
+         (texfile (expand-file-name (concat hash ".tex")
+                                    markdown-overlays--latex-cache-dir))
+         (dvifile (expand-file-name (concat hash ".dvi")
+                                    markdown-overlays--latex-cache-dir))
+         (options (and (boundp 'org-format-latex-options) org-format-latex-options))
+         (scale (or (plist-get options :scale) 1.5))
+         (dpi (truncate (* 140 scale))))
+    (if (file-exists-p cache-file)
+        ;; Cache hit.
+        (markdown-overlays--place-latex-overlay cache-file beg end buffer)
+      ;; Write .tex file and compile asynchronously.
+      (with-temp-file texfile
+        (insert "\\documentclass[preview]{standalone}\n"
+                "\\usepackage{amsmath,amssymb,amsfonts}\n"
+                "\\begin{document}\n"
+                latex-string "\n"
+                "\\end{document}\n"))
+      (let ((proc (make-process
+                   :name (concat "markdown-overlays-latex-" (substring hash 0 8))
+                   :buffer nil
+                   :command (list "latex" "-interaction=nonstopmode"
+                                  (concat "-output-directory=" markdown-overlays--latex-cache-dir)
+                                  texfile)
+                   :sentinel
+                   (lambda (proc _event)
+                     (when (and (eq (process-status proc) 'exit)
+                                (eq (process-exit-status proc) 0))
+                       ;; Chain: dvi -> png.
+                       (make-process
+                        :name (concat "markdown-overlays-dvipng-" (substring hash 0 8))
+                        :buffer nil
+                        :command (list "dvipng"
+                                       "-D" (number-to-string dpi)
+                                       "-T" "tight"
+                                       "-bg" "Transparent"
+                                       "-o" cache-file
+                                       dvifile)
+                        :sentinel
+                        (lambda (proc2 _event2)
+                          (when (and (eq (process-status proc2) 'exit)
+                                     (eq (process-exit-status proc2) 0))
+                            (markdown-overlays--place-latex-overlay
+                             cache-file beg end buffer)))))))))))
+    nil))
+
+(defun markdown-overlays--render-latex-async (avoid-ranges)
+  "Find and render all LaTeX fragments asynchronously, skipping AVOID-RANGES."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((buf (current-buffer)))
+      (while (re-search-forward markdown-overlays--latex-regexp nil t)
+        (let* ((frag-beg (match-beginning 0))
+               (frag-end (match-end 0))
+               (latex-string (or (match-string-no-properties 1)
+                                 (match-string-no-properties 2)
+                                 (match-string-no-properties 3)))
+               (in-avoided (cl-some (lambda (range)
+                                      (and (< frag-beg (cdr range))
+                                           (> frag-end (car range))))
+                                    avoid-ranges)))
+          (unless in-avoided
+            ;; Wrap display math back in delimiters for proper rendering.
+            (let ((full-latex
+                   (cond
+                    ((match-string 1) (concat "\\(" latex-string "\\)"))
+                    ((match-string 2) (concat "\\[" latex-string "\\]"))
+                    (t (concat "$$" latex-string "$$")))))
+              (markdown-overlays--render-latex-fragment
+               full-latex frag-beg frag-end buf))))))))
 
 (defun markdown-overlays--match-source-block ()
   "Return a matched source block by the previous search/regexp operation."
