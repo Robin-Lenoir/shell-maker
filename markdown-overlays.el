@@ -85,6 +85,16 @@ Objective-C -> (\"objective-c\" . \"objc\")"
        (zero-or-more whitespace)
        (group "```") (or "\n" eol)))
 
+(defvar markdown-overlays--latex-cache-dir
+  (expand-file-name "markdown-overlays-latex" temporary-file-directory)
+  "Directory for cached LaTeX renderings.")
+
+(defvar markdown-overlays--latex-regexp
+  (rx (or (seq "\\(" (group-n 1 (+? anything)) "\\)")
+          (seq "\\[" (group-n 2 (+? anything)) "\\]")
+          (seq "$$" (group-n 3 (+? anything)) "$$")))
+  "Regexp matching LaTeX fragments: \\(...\\), \\[...\\], and $$...$$.")
+
 (defun markdown-overlays-remove ()
   "Remove all Markdown overlays."
   (remove-overlays (point-min) (point-max) 'category 'markdown-overlays))
@@ -213,16 +223,6 @@ Return an alist with details of all overlays added:
       (strikethroughs . ,strikethroughs)
       (tables . ,tables)
       (avoided-ranges . ,avoid-ranges))))
-
-(defvar markdown-overlays--latex-cache-dir
-  (expand-file-name "markdown-overlays-latex" temporary-file-directory)
-  "Directory for cached LaTeX renderings.")
-
-(defvar markdown-overlays--latex-regexp
-  (rx (or (seq "\\(" (group-n 1 (+? anything)) "\\)")
-          (seq "\\[" (group-n 2 (+? anything)) "\\]")
-          (seq "$$" (group-n 3 (+? anything)) "$$")))
-  "Regexp matching LaTeX fragments: \\(...\\), \\[...\\], and $$...$$.")
 
 (defun markdown-overlays--latex-cache-file (hash)
   "Return cache file path for content HASH."
