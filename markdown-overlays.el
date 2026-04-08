@@ -271,31 +271,31 @@ Return an alist with details of all overlays added:
                 "\\begin{document}\n"
                 latex-string "\n"
                 "\\end{document}\n"))
-      (let ((proc (make-process
-                   :name (concat "markdown-overlays-latex-" (substring hash 0 8))
-                   :buffer nil
-                   :command (list "latex" "-interaction=nonstopmode"
-                                  (concat "-output-directory=" markdown-overlays--latex-cache-dir)
-                                  texfile)
-                   :sentinel
-                   (lambda (proc _event)
-                     (when (and (eq (process-status proc) 'exit)
-                                (eq (process-exit-status proc) 0))
-                       ;; Chain: dvi -> svg.
-                       (make-process
-                        :name (concat "markdown-overlays-dvisvgm-" (substring hash 0 8))
-                        :buffer nil
-                        :command (list "dvisvgm"
-                                       "--no-fonts"
-                                       "--exact-bbox"
-                                       (concat "--output=" cache-file)
-                                       dvifile)
-                        :sentinel
-                        (lambda (proc2 _event2)
-                          (when (and (eq (process-status proc2) 'exit)
-                                     (eq (process-exit-status proc2) 0))
-                            (markdown-overlays--place-latex-overlay
-                             cache-file beg end buffer)))))))))))
+      (make-process
+       :name (concat "markdown-overlays-latex-" (substring hash 0 8))
+       :buffer nil
+       :command (list "latex" "-interaction=nonstopmode"
+                      (concat "-output-directory=" markdown-overlays--latex-cache-dir)
+                      texfile)
+       :sentinel
+       (lambda (proc _event)
+         (when (and (eq (process-status proc) 'exit)
+                    (eq (process-exit-status proc) 0))
+           ;; Chain: dvi -> svg.
+           (make-process
+            :name (concat "markdown-overlays-dvisvgm-" (substring hash 0 8))
+            :buffer nil
+            :command (list "dvisvgm"
+                           "--no-fonts"
+                           "--exact-bbox"
+                           (concat "--output=" cache-file)
+                           dvifile)
+            :sentinel
+            (lambda (proc2 _event2)
+              (when (and (eq (process-status proc2) 'exit)
+                         (eq (process-exit-status proc2) 0))
+                (markdown-overlays--place-latex-overlay
+                 cache-file beg end buffer))))))))
     nil))
 
 (defun markdown-overlays--render-latex-async (avoid-ranges)
