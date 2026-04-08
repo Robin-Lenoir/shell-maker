@@ -228,7 +228,7 @@ Return an alist with details of all overlays added:
   "Return cache file path for content HASH."
   (unless (file-directory-p markdown-overlays--latex-cache-dir)
     (make-directory markdown-overlays--latex-cache-dir t))
-  (expand-file-name (concat hash ".png") markdown-overlays--latex-cache-dir))
+  (expand-file-name (concat hash ".svg") markdown-overlays--latex-cache-dir))
 
 (defun markdown-overlays--place-latex-overlay (image-file beg end buffer)
   "Place an image overlay in BUFFER between BEG and END using IMAGE-FILE."
@@ -243,7 +243,7 @@ Return an alist with details of all overlays added:
             (delete-overlay ov)))
         (let ((ov (make-overlay beg end nil t nil)))
           (overlay-put ov 'display
-                       (create-image image-file 'png nil
+                       (create-image image-file 'svg nil
                                      :ascent 'center
                                      :margin 2))
           (overlay-put ov 'category 'markdown-overlays-latex)
@@ -259,9 +259,7 @@ Return an alist with details of all overlays added:
                                     markdown-overlays--latex-cache-dir))
          (dvifile (expand-file-name (concat hash ".dvi")
                                     markdown-overlays--latex-cache-dir))
-         (options (and (boundp 'org-format-latex-options) org-format-latex-options))
-         (scale (or (plist-get options :scale) 1.5))
-         (dpi (truncate (* 140 scale))))
+)
     (if (file-exists-p cache-file)
         ;; Cache hit.
         (markdown-overlays--place-latex-overlay cache-file beg end buffer)
@@ -282,15 +280,14 @@ Return an alist with details of all overlays added:
                    (lambda (proc _event)
                      (when (and (eq (process-status proc) 'exit)
                                 (eq (process-exit-status proc) 0))
-                       ;; Chain: dvi -> png.
+                       ;; Chain: dvi -> svg.
                        (make-process
-                        :name (concat "markdown-overlays-dvipng-" (substring hash 0 8))
+                        :name (concat "markdown-overlays-dvisvgm-" (substring hash 0 8))
                         :buffer nil
-                        :command (list "dvipng"
-                                       "-D" (number-to-string dpi)
-                                       "-T" "tight"
-                                       "-bg" "Transparent"
-                                       "-o" cache-file
+                        :command (list "dvisvgm"
+                                       "--no-fonts"
+                                       "--exact-bbox"
+                                       (concat "--output=" cache-file)
                                        dvifile)
                         :sentinel
                         (lambda (proc2 _event2)
