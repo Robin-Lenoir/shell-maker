@@ -245,7 +245,8 @@ Return an alist with details of all overlays added:
           (overlay-put ov 'display
                        (create-image image-file 'svg nil
                                      :ascent 'center
-                                     :margin 2))
+                                     :margin 2
+                                     :background "none"))
           (overlay-put ov 'category 'markdown-overlays-latex)
           (overlay-put ov 'evaporate t)
           (overlay-put ov 'modification-hooks
