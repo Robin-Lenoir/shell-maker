@@ -85,11 +85,11 @@ Objective-C -> (\"objective-c\" . \"objc\")"
        (zero-or-more whitespace)
        (group "```") (or "\n" eol)))
 
-(defvar markdown-overlays--latex-cache-dir
+(defconst markdown-overlays--latex-cache-dir
   (expand-file-name "markdown-overlays-latex" temporary-file-directory)
   "Directory for cached LaTeX renderings.")
 
-(defvar markdown-overlays--latex-regexp
+(defconst markdown-overlays--latex-regexp
   (rx (or (seq "\\(" (group-n 1 (+? anything)) "\\)")
           (seq "\\[" (group-n 2 (+? anything)) "\\]")
           (seq "$$" (group-n 3 (+? anything)) "$$")))
