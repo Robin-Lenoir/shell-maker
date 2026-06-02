@@ -89,6 +89,35 @@ Objective-C -> (\"objective-c\" . \"objc\")"
   (expand-file-name "markdown-overlays-latex" temporary-file-directory)
   "Directory for cached LaTeX renderings.")
 
+(defcustom markdown-overlays-latex-max-concurrent 2
+  "Maximum number of LaTeX+dvisvgm renders running concurrently.
+During a streamed AI response containing many math fragments, unbounded
+parallelism can trigger full-system memory pressure as dozens of dvisvgm
+processes accumulate.  Pending renders queue and drain as slots free."
+  :type 'integer
+  :group 'markdown-overlays)
+
+(defvar markdown-overlays--latex-active 0
+  "Count of currently-running LaTeX render chains.")
+
+(defvar markdown-overlays--latex-queue nil
+  "FIFO of pending render thunks, each a nullary lambda.")
+
+(defvar markdown-overlays--latex-inflight (make-hash-table :test 'equal)
+  "Set of fragment hashes currently being rendered (dedup during streaming).")
+
+(defun markdown-overlays--latex-release-slot ()
+  "Release one render slot and start the next queued job, if any."
+  (setq markdown-overlays--latex-active
+        (max 0 (1- markdown-overlays--latex-active)))
+  (when (and markdown-overlays--latex-queue
+             (< markdown-overlays--latex-active
+                markdown-overlays-latex-max-concurrent))
+    (let ((thunk (car (last markdown-overlays--latex-queue))))
+      (setq markdown-overlays--latex-queue
+            (butlast markdown-overlays--latex-queue))
+      (funcall thunk))))
+
 (defconst markdown-overlays--latex-regexp
   (rx (or (seq "\\(" (group-n 1 (+? anything)) "\\)")
           (seq "\\[" (group-n 2 (+? anything)) "\\]")
@@ -253,35 +282,59 @@ Return an alist with details of all overlays added:
                        (list (lambda (ov &rest _) (delete-overlay ov)))))))))
 
 (defun markdown-overlays--render-latex-fragment (latex-string beg end buffer)
-  "Render LATEX-STRING asynchronously, place overlay between BEG and END in BUFFER."
+  "Render LATEX-STRING asynchronously, place overlay between BEG and END in BUFFER.
+Respects `markdown-overlays-latex-max-concurrent' via a FIFO queue, and
+dedups in-flight fragments by SHA1 so repeat matches during streaming
+don't double-spawn."
   (let* ((hash (sha1 latex-string))
-         (cache-file (markdown-overlays--latex-cache-file hash))
+         (cache-file (markdown-overlays--latex-cache-file hash)))
+    (cond
+     ;; Cache hit — place overlay immediately, no slot needed.
+     ((file-exists-p cache-file)
+      (markdown-overlays--place-latex-overlay cache-file beg end buffer))
+     ;; Already rendering this hash — skip the spawn.
+     ;; (The in-flight render will not know about this overlay's beg/end,
+     ;; but the next streaming-update pass picks it up from the cache file.)
+     ((gethash hash markdown-overlays--latex-inflight) nil)
+     ;; Otherwise: schedule (immediate or queued).
+     (t
+      (let ((thunk (lambda ()
+                     (markdown-overlays--latex-start-render
+                      latex-string hash beg end buffer))))
+        (if (< markdown-overlays--latex-active
+               markdown-overlays-latex-max-concurrent)
+            (funcall thunk)
+          (push thunk markdown-overlays--latex-queue)))))
+    nil))
+
+(defun markdown-overlays--latex-start-render (latex-string hash beg end buffer)
+  "Actually spawn latex+dvisvgm for LATEX-STRING (known HASH).
+Slot accounting: increments on entry, decrements in the sentinel on ANY exit."
+  (let* ((cache-file (markdown-overlays--latex-cache-file hash))
          (texfile (expand-file-name (concat hash ".tex")
                                     markdown-overlays--latex-cache-dir))
          (dvifile (expand-file-name (concat hash ".dvi")
-                                    markdown-overlays--latex-cache-dir))
-)
-    (if (file-exists-p cache-file)
-        ;; Cache hit.
-        (markdown-overlays--place-latex-overlay cache-file beg end buffer)
-      ;; Write .tex file and compile asynchronously.
-      (with-temp-file texfile
-        (insert "\\documentclass[preview]{standalone}\n"
-                "\\usepackage{amsmath,amssymb,amsfonts}\n"
-                "\\begin{document}\n"
-                latex-string "\n"
-                "\\end{document}\n"))
-      (make-process
-       :name (concat "markdown-overlays-latex-" (substring hash 0 8))
-       :buffer nil
-       :command (list "latex" "-interaction=nonstopmode"
-                      (concat "-output-directory=" markdown-overlays--latex-cache-dir)
-                      texfile)
-       :sentinel
-       (lambda (proc _event)
-         (when (and (eq (process-status proc) 'exit)
-                    (eq (process-exit-status proc) 0))
-           ;; Chain: dvi -> svg.
+                                    markdown-overlays--latex-cache-dir)))
+    (setq markdown-overlays--latex-active
+          (1+ markdown-overlays--latex-active))
+    (puthash hash t markdown-overlays--latex-inflight)
+    (with-temp-file texfile
+      (insert "\\documentclass[preview]{standalone}\n"
+              "\\usepackage{amsmath,amssymb,amsfonts}\n"
+              "\\begin{document}\n"
+              latex-string "\n"
+              "\\end{document}\n"))
+    (make-process
+     :name (concat "markdown-overlays-latex-" (substring hash 0 8))
+     :buffer nil
+     :command (list "latex" "-interaction=nonstopmode"
+                    (concat "-output-directory=" markdown-overlays--latex-cache-dir)
+                    texfile)
+     :sentinel
+     (lambda (proc _event)
+       (if (and (eq (process-status proc) 'exit)
+                (eq (process-exit-status proc) 0))
+           ;; latex succeeded — chain dvisvgm (keep slot held).
            (make-process
             :name (concat "markdown-overlays-dvisvgm-" (substring hash 0 8))
             :buffer nil
@@ -292,11 +345,16 @@ Return an alist with details of all overlays added:
                            dvifile)
             :sentinel
             (lambda (proc2 _event2)
-              (when (and (eq (process-status proc2) 'exit)
-                         (eq (process-exit-status proc2) 0))
-                (markdown-overlays--place-latex-overlay
-                 cache-file beg end buffer))))))))
-    nil))
+              (unwind-protect
+                  (when (and (eq (process-status proc2) 'exit)
+                             (eq (process-exit-status proc2) 0))
+                    (markdown-overlays--place-latex-overlay
+                     cache-file beg end buffer))
+                (remhash hash markdown-overlays--latex-inflight)
+                (markdown-overlays--latex-release-slot))))
+         ;; latex failed — release slot now, no dvisvgm.
+         (remhash hash markdown-overlays--latex-inflight)
+         (markdown-overlays--latex-release-slot))))))
 
 (defun markdown-overlays--render-latex-async (avoid-ranges)
   "Find and render all LaTeX fragments asynchronously, skipping AVOID-RANGES."
