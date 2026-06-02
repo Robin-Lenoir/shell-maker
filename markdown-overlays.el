@@ -272,10 +272,13 @@ Return an alist with details of all overlays added:
             (delete-overlay ov)))
         (let ((ov (make-overlay beg end nil t nil)))
           (overlay-put ov 'display
+                       ;; No :background — "none" isn't a parseable color, so
+                       ;; Emacs fell back to the opaque frame bg and drew a dark
+                       ;; box.  Omitting it keeps the SVG's alpha, letting it
+                       ;; blend with the alpha-background (picom) frame.
                        (create-image image-file 'svg nil
                                      :ascent 'center
-                                     :margin 2
-                                     :background "none"))
+                                     :margin 2))
           (overlay-put ov 'category 'markdown-overlays-latex)
           (overlay-put ov 'evaporate t)
           (overlay-put ov 'modification-hooks
