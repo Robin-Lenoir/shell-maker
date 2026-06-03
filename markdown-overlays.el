@@ -97,6 +97,16 @@ processes accumulate.  Pending renders queue and drain as slots free."
   :type 'integer
   :group 'markdown-overlays)
 
+(defcustom markdown-overlays-latex-xpm-density 200
+  "Rasterisation DPI for the SVG->XPM step of LaTeX previews.
+XPM is the only image format Emacs renders transparently on an
+`alpha-background' frame (bug#59944: SVG/PNG transparent regions get an
+opaque fill), so previews are converted to XPM to bleed the frame
+background.  Higher = crisper but larger/slower; XPM has no anti-aliased
+edges (the price of true transparency)."
+  :type 'integer
+  :group 'markdown-overlays)
+
 (defvar markdown-overlays--latex-active 0
   "Count of currently-running LaTeX render chains.")
 
@@ -257,7 +267,7 @@ Return an alist with details of all overlays added:
   "Return cache file path for content HASH."
   (unless (file-directory-p markdown-overlays--latex-cache-dir)
     (make-directory markdown-overlays--latex-cache-dir t))
-  (expand-file-name (concat hash ".svg") markdown-overlays--latex-cache-dir))
+  (expand-file-name (concat hash ".xpm") markdown-overlays--latex-cache-dir))
 
 (defun markdown-overlays--place-latex-overlay (image-file beg end buffer)
   "Place an image overlay in BUFFER between BEG and END using IMAGE-FILE."
@@ -272,11 +282,12 @@ Return an alist with details of all overlays added:
             (delete-overlay ov)))
         (let ((ov (make-overlay beg end nil t nil)))
           (overlay-put ov 'display
-                       ;; No :background — "none" isn't a parseable color, so
-                       ;; Emacs fell back to the opaque frame bg and drew a dark
-                       ;; box.  Omitting it keeps the SVG's alpha, letting it
-                       ;; blend with the alpha-background (picom) frame.
-                       (create-image image-file 'svg nil
+                       ;; XPM (not SVG): its `None' colour routes through
+                       ;; Emacs's image mask path, which skips the opaque
+                       ;; background fill, so the preview bleeds the
+                       ;; alpha-background frame.  SVG/PNG can't (bug#59944).
+                       ;; No :background — that would re-introduce an opaque box.
+                       (create-image image-file 'xpm nil
                                      :ascent 'center
                                      :margin 2))
           (overlay-put ov 'category 'markdown-overlays-latex)
@@ -311,20 +322,38 @@ don't double-spawn."
     nil))
 
 (defun markdown-overlays--latex-start-render (latex-string hash beg end buffer)
-  "Actually spawn latex+dvisvgm for LATEX-STRING (known HASH).
-Slot accounting: increments on entry, decrements in the sentinel on ANY exit."
-  (let* ((cache-file (markdown-overlays--latex-cache-file hash))
+  "Spawn latex -> dvisvgm -> magick for LATEX-STRING (known HASH).
+Renders to a transparent XPM (via an intermediate SVG) so the preview
+bleeds the `alpha-background' frame; SVG/PNG can't (Emacs bug#59944).
+The glyphs are coloured with the default-face foreground so they stay
+visible once the opaque background is gone.
+
+One render slot covers the whole latex->dvisvgm->magick chain (so the
+`markdown-overlays-latex-max-concurrent' cap limits CHAINS, not raw
+process count); it is released in the terminal sentinel on ANY exit."
+  (let* ((cache-file (markdown-overlays--latex-cache-file hash)) ; .xpm
          (texfile (expand-file-name (concat hash ".tex")
                                     markdown-overlays--latex-cache-dir))
          (dvifile (expand-file-name (concat hash ".dvi")
-                                    markdown-overlays--latex-cache-dir)))
+                                    markdown-overlays--latex-cache-dir))
+         (svgfile (expand-file-name (concat hash ".svg")
+                                    markdown-overlays--latex-cache-dir))
+         ;; default-face foreground as 6-hex for xcolor's HTML model.
+         (fg (let ((rgb (color-values
+                         (or (face-foreground 'default nil t) "white"))))
+               (if rgb
+                   (apply #'format "%02X%02X%02X"
+                          (mapcar (lambda (c) (ash c -8)) rgb))
+                 "FFFFFF"))))
     (setq markdown-overlays--latex-active
           (1+ markdown-overlays--latex-active))
     (puthash hash t markdown-overlays--latex-inflight)
     (with-temp-file texfile
       (insert "\\documentclass[preview]{standalone}\n"
               "\\usepackage{amsmath,amssymb,amsfonts}\n"
+              "\\usepackage{xcolor}\n"
               "\\begin{document}\n"
+              "\\color[HTML]{" fg "}%\n"
               latex-string "\n"
               "\\end{document}\n"))
     (make-process
@@ -335,29 +364,43 @@ Slot accounting: increments on entry, decrements in the sentinel on ANY exit."
                     texfile)
      :sentinel
      (lambda (proc _event)
-       (if (and (eq (process-status proc) 'exit)
-                (eq (process-exit-status proc) 0))
-           ;; latex succeeded — chain dvisvgm (keep slot held).
-           (make-process
-            :name (concat "markdown-overlays-dvisvgm-" (substring hash 0 8))
-            :buffer nil
-            :command (list "dvisvgm"
-                           "--no-fonts"
-                           "--exact-bbox"
-                           (concat "--output=" cache-file)
-                           dvifile)
-            :sentinel
-            (lambda (proc2 _event2)
-              (unwind-protect
-                  (when (and (eq (process-status proc2) 'exit)
-                             (eq (process-exit-status proc2) 0))
-                    (markdown-overlays--place-latex-overlay
-                     cache-file beg end buffer))
-                (remhash hash markdown-overlays--latex-inflight)
-                (markdown-overlays--latex-release-slot))))
-         ;; latex failed — release slot now, no dvisvgm.
-         (remhash hash markdown-overlays--latex-inflight)
-         (markdown-overlays--latex-release-slot))))))
+       (if (not (and (eq (process-status proc) 'exit)
+                     (eq (process-exit-status proc) 0)))
+           ;; latex failed — release slot now.
+           (progn (remhash hash markdown-overlays--latex-inflight)
+                  (markdown-overlays--latex-release-slot))
+         ;; latex ok — chain dvisvgm -> intermediate SVG (slot held).
+         (make-process
+          :name (concat "markdown-overlays-dvisvgm-" (substring hash 0 8))
+          :buffer nil
+          :command (list "dvisvgm" "--no-fonts" "--exact-bbox"
+                         (concat "--output=" svgfile)
+                         dvifile)
+          :sentinel
+          (lambda (proc2 _event2)
+            (if (not (and (eq (process-status proc2) 'exit)
+                          (eq (process-exit-status proc2) 0)))
+                ;; dvisvgm failed — release slot.
+                (progn (remhash hash markdown-overlays--latex-inflight)
+                       (markdown-overlays--latex-release-slot))
+              ;; dvisvgm ok — chain magick SVG -> XPM (slot held).
+              (make-process
+               :name (concat "markdown-overlays-magick-" (substring hash 0 8))
+               :buffer nil
+               :command (list "magick"
+                              "-density" (number-to-string
+                                          markdown-overlays-latex-xpm-density)
+                              "-background" "none"
+                              svgfile cache-file)
+               :sentinel
+               (lambda (proc3 _event3)
+                 (unwind-protect
+                     (when (and (eq (process-status proc3) 'exit)
+                                (eq (process-exit-status proc3) 0))
+                       (markdown-overlays--place-latex-overlay
+                        cache-file beg end buffer))
+                   (remhash hash markdown-overlays--latex-inflight)
+                   (markdown-overlays--latex-release-slot))))))))))))
 
 (defun markdown-overlays--render-latex-async (avoid-ranges)
   "Find and render all LaTeX fragments asynchronously, skipping AVOID-RANGES."
